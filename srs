@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# use sqlite to store items
+
+DATABASE="db.sql"
+deck="default"
+
+# Define database schema
+#set -x
+STRUCTURE="CREATE TABLE items (id INTEGER PRIMARY KEY,question TEXT,answer TEXT,deck TEXT,last_review_date INTEGER,next_review_date INTEGER);CREATE TABLE review_history (id INTEGER,review_date INTEGER, PRIMARY KEY (id,review_date));"
+
+function determine_os() {
+	if [[ "$OSTYPE" == "linux-gnu" ]]; then
+		DATE_BIN=$(which date)
+	elif [[ "$OSTYPE" == "darwin"* ]]; then
+		which gdate >/dev/null || brew install coreutils >/dev/null
+		DATE_BIN=$(which gdate)	
+	else
+		echo "Running on an unsupported platform. Quitting"
+		exit 1
+	fi
+}
+
+# function add: add an item into database
+function add () {
+    question="$1"
+    answer="$2"
+    if [ -z "$1" ]
+        then
+            # prompt user for question and then password
+            read -p "Question: "  question
+            read -p "Answer: " answer      
+    fi
+    today=$($DATE_BIN +%Y%m%d)
+    sqlite3 "$DATABASE" "insert into items (question,answer,deck,last_review_date,next_review_date) values ('$question','$answer','$deck','$today','$today');"
+}
+
+# function export: dump contents of sqlite database to file or output
+function export () {
+    sqlite3 -list "$DATABASE" "select * from items;"
+}
+
+function search () {
+    sqlite3 -header -line "$DATABASE" "select id,question,answer,deck from items where (question like '%$1%' or answer like '%$1%') and deck like '%$deck%';"
+}
+
+# function review: display questions that have next_review_date = today
+function review () {
+    today=$($DATE_BIN +%Y%m%d)
+    origIFS="$IFS"
+    IFS=$'\n'
+    # Adding new_items to review 
+    new_items="$1"
+    if [ ! -z $1 ]; then 
+        echo Adding $1 items to "$deck" deck
+        sqlite3 "$DATABASE" "update items set deck='$deck',last_review_date='$today',next_review_date='$today' where deck='later' limit '$1';"
+    fi
+    LIST=($(sqlite3 "$DATABASE" "select * from items where next_review_date<=$today and deck!='later';"))
+    # Use for debugging
+    #echo "${LIST[*]}"
+    if [ -z "$LIST" ];then
+        echo Nothing to review today
+        exit 0
+    fi
+    echo You have "${#LIST[@]}" items to review today
+    while [ "${#LIST[@]}" -ne 0 ];do
+        echo Reviewing "${#LIST[@]}" items
+        for ROW in "${LIST[@]}";do
+            id=$(echo $ROW | cut -f1 -d"|")
+            question=$(echo $ROW | cut -f2 -d"|")
+            answer=$(echo $ROW | cut -f3 -d"|")
+            deck=$(echo $ROW | cut -f4 -d"|")
+            last_review_date=$(echo $ROW | cut -f5 -d"|")
+            next_review_date=$(echo $ROW | cut -f6 -d"|")
+            echo -n Q: $question
+            read
+            echo A: $answer
+            read -p "Did you know the answer?[Y/n] " recall
+            echo
+            if [ "$recall" = "y" ] || [ -z "$recall" ]; then
+                sqlite3 "$DATABASE" "insert into review_history (id,review_date) values ($id,$today);" 2>/dev/null
+                if [ $last_review_date -eq $next_review_date ];then
+                    next_review_date=$($DATE_BIN +%Y%m%d -d "today+1day")
+                else
+                    last_review_date_in_seconds=$($DATE_BIN +%s -d $last_review_date)
+                    next_review_date_in_seconds=$($DATE_BIN +%s -d $next_review_date)
+                    time_difference_in_seconds=$((next_review_date_in_seconds - last_review_date_in_seconds))
+                    time_difference_in_days=$($DATE_BIN -d @$time_difference_in_seconds +%d)
+                    next_review_date=$($DATE_BIN +%Y%m%d -d "$today + $((($time_difference_in_days-1)*2)) days")
+            fi
+            else
+                next_review_date=$($DATE_BIN +%Y%m%d -d $today)
+            fi
+            sqlite3 "$DATABASE" "update items set last_review_date=$today,next_review_date=$next_review_date where id=$id;"
+        done
+        LIST=($(sqlite3 "$DATABASE" "select * from items where next_review_date<=$today and deck!='later';"))
+        clear
+    done
+    IFS="$origIFS"
+}
+
+# display for each day how many items were reviewed (for past days) or how many items are due for review (future days)
+function stats (){
+    echo "   Date   Items (to be) reviewed"
+    sqlite3 "$DATABASE" -column "select review_date,count() from review_history group by review_date order by review_date asc;"
+}
+
+function usage(){
+    programname=$0
+    echo "usage: $programname [add|review|search|export|stats]"
+    echo "   add              add a new question and answer pair"
+    echo "   review [items]   review questions that are due today + [items] that are in 'later' deck"
+    echo "   search <string>  search for a string in question or in an answer"
+    echo "   export           export question and answers from sqlite database to stdout"
+    echo "   stats            display how many items were reviewed each day and are due for review in the future"
+}
+
+# Check if database file exists, if not then create it
+if [ ! -e "$DATABASE" ]
+    then
+        echo database "$DATABASE" does not exist. Creating now
+        sqlite3 "$DATABASE" <<< "$STRUCTURE"
+fi
+
+if [ $# -eq 0 ];then 
+    usage
+fi
+
+# determine and configure os
+determine_os
+
+# function import: add items from a input or file into sqlite database
+
+while getopts "f:d:" option
+do  
+    case "${option}" in
+        f) database=${OPTARG};;
+        d) deck=${OPTARG};;
+    esac
+    #echo option is $option
+done
+shift $((OPTIND-1))
+
+case "$1" in
+    add) add "$2" "$3";;
+    export) export;;
+    review) review $2;;
+    search) search "$2";;
+    stats) stats;;
+esac
